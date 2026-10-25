@@ -1,0 +1,111 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: my-backend-service
+
+jobs:
+  # CI Phase
+  ci-build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Print Environment Variables
+        run: |
+          echo "=== Current Environment Variables ==="
+          env | sort
+          echo "====================================="
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies and Package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          echo "Dependencies installed and project packaged."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Generate Timestamp Tag
+        id: timestamp
+        run: echo "tag=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.timestamp.outputs.tag }} .
+
+      - name: Push Docker Image
+        run: |
+          docker push ${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.timestamp.outputs.tag }}
+
+      - name: Save Docker Image as Tar
+        run: |
+          docker save -o image-${{ steps.timestamp.outputs.tag }}.tar ${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.timestamp.outputs.tag }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-tar
+          path: image-${{ steps.timestamp.outputs.tag }}.tar
+
+      - name: Print Final Image Version
+        run: |
+          echo "Final Image Version: ${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.timestamp.outputs.tag }}"
+
+  # CD Phase
+  cd-deploy:
+    needs: ci-build-and-push
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [DEV, PROD]
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-tar
+
+      - name: Set Environment Suffix
+        id: env-suffix
+        run: |
+          if [ "${{ matrix.environment }}" == "DEV" ]; then
+            echo "suffix=dev" >> $GITHUB_OUTPUT
+          else
+            echo "suffix=prod" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Load Docker Image
+        run: |
+          docker load -i image-*.tar
+
+      - name: Retag Image for Environment
+        run: |
+          # Find the original tag from the loaded image or filename
+          ORIGINAL_TAG=$(ls image-*.tar | sed 's/image-//;s/.tar//')
+          FULL_IMAGE_NAME="${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${ORIGINAL_TAG}"
+          NEW_TAG="${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${ORIGINAL_TAG}-${{ steps.env-suffix.outputs.suffix }}"
+          
+          echo "Retagging $FULL_IMAGE_NAME to $NEW_TAG"
+          docker tag $FULL_IMAGE_NAME $NEW_TAG
+
+      - name: List Local Images
+        run: |
+          echo "=== Local Docker Images ==="
+          docker images
+          echo "=========================="
